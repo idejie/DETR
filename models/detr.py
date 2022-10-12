@@ -112,7 +112,9 @@ class SetCriterion(nn.Module):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
+        
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # print(target_classes_o)
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
        
@@ -280,7 +282,7 @@ class PostProcess(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
-        results = [{'scores': s, 'labels': l+1, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
 
         return results
 

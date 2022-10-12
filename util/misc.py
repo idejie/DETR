@@ -200,7 +200,7 @@ class MetricLogger(object):
         data_time = SmoothedValue(fmt='{avg:.4f}')
         space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
         if torch.cuda.is_available():
-            log_msg = self.delimiter.join([
+            log_msg = self.delimiter.join([datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
                 header,
                 '[{0' + space_fmt + '}/{1}]',
                 'eta: {eta}',
@@ -210,7 +210,7 @@ class MetricLogger(object):
                 'max mem: {memory:.0f}'
             ])
         else:
-            log_msg = self.delimiter.join([
+            log_msg = self.delimiter.join([datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
                 header,
                 '[{0' + space_fmt + '}/{1}]',
                 'eta: {eta}',

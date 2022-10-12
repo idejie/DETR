@@ -16,9 +16,10 @@ def get_coco_api_from_dataset(dataset):
 
 
 def build_dataset(image_set, args):
-    if args.dataset_file == 'coco':
+    if args.dataset_file in ['coco','ego4d']:
         print('image_set', image_set)
         return build_coco(image_set, args)
+    
     if args.dataset_file == 'coco_panoptic':
         # to avoid making panopticapi required for coco
         from .coco_panoptic import build as build_coco_panoptic

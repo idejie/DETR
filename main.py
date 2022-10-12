@@ -24,7 +24,7 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=4, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--lr_drop', default=200, type=int)
+    parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -80,7 +80,7 @@ def get_args_parser():
                         help="Relative classification weight of the no-object class")
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
+    parser.add_argument('--dataset_file', default='ego4d')
     parser.add_argument('--coco_path', type=str, default='data')
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
@@ -142,31 +142,36 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    if args.dataset_file == 'ego4d':
+        dataset_train = build_dataset(image_set='train', args=args)
+        dataset_mini_val = build_dataset(image_set='mini_val', args=args)
+        dataset_val = build_dataset(image_set='val', args=args)
 
-    dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
+        if args.distributed:
+            sampler_train = DistributedSampler(dataset_train)
+            sampler_mini_val = DistributedSampler(dataset_mini_val, shuffle=False)
+            sampler_val = DistributedSampler(dataset_val, shuffle=False)
+        else:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
+            sampler_mini_val = torch.utils.data.SequentialSampler(dataset_mini_val)
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if args.distributed:
-        sampler_train = DistributedSampler(dataset_train)
-        sampler_val = DistributedSampler(dataset_val, shuffle=False)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        batch_sampler_train = torch.utils.data.BatchSampler(
+            sampler_train, args.batch_size, drop_last=True)
 
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
+        data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
+                                    collate_fn=utils.collate_fn, num_workers=args.num_workers)
+        data_loader_mini_val = DataLoader(dataset_mini_val, args.batch_size, sampler=sampler_mini_val,
+                                    drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
+        data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
+                                    drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
+        if args.dataset_file == "coco_panoptic":
+            # We also evaluate AP during panoptic training, on original coco DS
+            coco_val = datasets.coco.build("val", args)
+            base_ds = get_coco_api_from_dataset(coco_val)
+        else:
+            base_ds = get_coco_api_from_dataset(dataset_val)
 
-    data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                                   collate_fn=utils.collate_fn, num_workers=args.num_workers)
-    data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                                 drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
-
-    if args.dataset_file == "coco_panoptic":
-        # We also evaluate AP during panoptic training, on original coco DS
-        coco_val = datasets.coco.build("val", args)
-        base_ds = get_coco_api_from_dataset(coco_val)
-    else:
-        base_ds = get_coco_api_from_dataset(dataset_val)
 
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu')
@@ -227,15 +232,27 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                 }, checkpoint_path)
-
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+       
+        mini_val_stats, coco_evaluator = evaluate(
+            model, criterion, postprocessors, data_loader_mini_val, base_ds, device, args.output_dir
         )
+        
+        if (epoch+1) %10 != 0:
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        **{f'mini_val_{k}': v for k, v in mini_val_stats.items()},
+                        'epoch': epoch,
+                        'n_parameters': n_parameters}
+        else:
+            test_stats, coco_evaluator = evaluate(
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            )
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        **{f'mini_val_{k}': v for k, v in mini_val_stats.items()},
+                        **{f'val_{k}': v for k, v in val_stats.items()},
+                        'epoch': epoch,
+                        'n_parameters': n_parameters}
+            
 
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:

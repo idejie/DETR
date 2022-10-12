@@ -93,7 +93,7 @@ class ConvertCocoPolysToMask(object):
 
         target = {}
         target["boxes"] = boxes
-        target["labels"] = classes -1 
+        target["labels"] = classes
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
@@ -119,7 +119,7 @@ def make_coco_transforms(image_set):
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    scales = [224,240,256,360,480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
+    scales = [200,224,240,256,300,360,400,420,480,500, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800]
 
     if image_set == 'train':
         return T.Compose([
@@ -136,7 +136,7 @@ def make_coco_transforms(image_set):
             normalize,
         ])
 
-    if image_set == 'val':
+    if image_set in ['val','mini_val']:
         return T.Compose([
             T.RandomResize([800], max_size=800),
             normalize,
@@ -150,8 +150,9 @@ def build(image_set, args):
     assert root.exists(), f'provided COCO path {root} does not exist'
     mode = 'instances'
     PATHS = {
-        "train": (root / "frames", root / "annotations" / f'train.json'),
-        "val": (root / "frames", root / "annotations" / f'val.json'),
+        "train": (root / "frames", root / "annotations" / f'ego4d_scod_train_split_single_frame.json'),
+        "mini_val": (root / "frames", root / "annotations" / f'ego4d_scod_mini_val_split_single_frame.json'),
+        "val": (root / "frames", root / "annotations" / f'ego4d_scod_val_single_frame.json'),
     }
 
     img_folder, ann_file = PATHS[image_set]
