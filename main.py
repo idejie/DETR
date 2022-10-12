@@ -169,8 +169,11 @@ def main(args):
             # We also evaluate AP during panoptic training, on original coco DS
             coco_val = datasets.coco.build("val", args)
             base_ds = get_coco_api_from_dataset(coco_val)
+            coco_mini_val = datasets.coco.build("mini_val", args)
+            base_ds_mini_val = get_coco_api_from_dataset(coco_mini_val)
         else:
             base_ds = get_coco_api_from_dataset(dataset_val)
+            base_ds_mini_val = get_coco_api_from_dataset(dataset_mini_val)
 
 
     if args.frozen_weights is not None:
@@ -179,11 +182,14 @@ def main(args):
 
     output_dir = Path(args.output_dir)
     if args.resume:
+        print('loading checkpoint', args.resume)
         try:
             if args.resume.startswith('https'):
+                print('loading checkpoint from url')
                 checkpoint = torch.hub.load_state_dict_from_url(
                     args.resume, map_location='cpu', check_hash=True)
             else:
+                print('loading checkpoint from local')
                 checkpoint = torch.load(args.resume, map_location='cpu')
         except:
             print(f"Error while loading checkpoint from [{args.resume}], training from [https]")
@@ -195,7 +201,9 @@ def main(args):
             model1["model"]["query_embed.weight"].resize_(args.num_queries,256)
             torch.save(model1, "detr-r50_test_%d.pth"%num_class)
             checkpoint = torch.load("detr-r50_test_%d.pth"%num_class, map_location='cpu')
+        print('loaded checkpoint', args.resume)
         model_without_ddp.load_state_dict(checkpoint['model'])
+        print('loaded model')
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -234,7 +242,7 @@ def main(args):
                 }, checkpoint_path)
        
         mini_val_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_mini_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_mini_val, base_ds_mini_val, device, args.output_dir
         )
         
         if (epoch+1) %10 != 0:
@@ -249,7 +257,7 @@ def main(args):
 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         **{f'mini_val_{k}': v for k, v in mini_val_stats.items()},
-                        **{f'val_{k}': v for k, v in val_stats.items()},
+                        **{f'val_{k}': v for k, v in test_stats.items()},
                         'epoch': epoch,
                         'n_parameters': n_parameters}
             
