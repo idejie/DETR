@@ -114,7 +114,6 @@ class SetCriterion(nn.Module):
         idx = self._get_src_permutation_idx(indices)
         
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        # print(target_classes_o)
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
        
@@ -259,7 +258,7 @@ class SetCriterion(nn.Module):
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
     @torch.no_grad()
-    def forward(self, outputs, target_sizes):
+    def forward(self, outputs, target_sizes,topk=15):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
@@ -277,12 +276,13 @@ class PostProcess(nn.Module):
         scores, labels = prob[..., :-1].max(-1)
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+        _,indices = torch.topk(scores,topk)
         # and from relative [0, 1] to absolute [0, height] coordinates
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
-        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        results = [{'scores': s[i], 'labels': l[i], 'boxes': b[i]} for s, l, b,i in zip(scores, labels, boxes,indices)]
 
         return results
 

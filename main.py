@@ -38,7 +38,7 @@ def get_args_parser():
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
-
+    parser.add_argument('--teacher', default=True, type=bool,action='store_false')
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
                         help="Number of encoding layers in the transformer")
@@ -76,6 +76,7 @@ def get_args_parser():
     parser.add_argument('--dice_loss_coef', default=1, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--distill_loss_coef', default=5, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 
@@ -188,6 +189,7 @@ def main(args):
                 print('loading checkpoint from url')
                 checkpoint = torch.hub.load_state_dict_from_url(
                     args.resume, map_location='cpu', check_hash=True)
+                
             else:
                 print('loading checkpoint from local')
                 checkpoint = torch.load(args.resume, map_location='cpu')
