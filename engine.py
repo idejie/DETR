@@ -16,7 +16,7 @@ from datasets.panoptic_eval import PanopticEvaluator
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0,teacher=False):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -28,8 +28,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-        outputs = model(samples)
+        if teacher:
+            gt_boxes = [gt['boxes'] if len(gt['boxes']) else torch.FloatTensor([[0,0,0,0]]).to(samples.tensors.device) for gt in targets]
+            
+        else:
+            gt_boxes = None
+        outputs = model(samples,gt_boxes=gt_boxes)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -65,13 +69,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(header,model, criterion, postprocessors, data_loader, base_ds, device, output_dir,teacher=False):
     model.eval()
     criterion.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    header = 'Test:'
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
@@ -88,8 +91,12 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-        outputs = model(samples)
+        if teacher:
+            gt_boxes = [gt['boxes'] if len(gt['boxes']) else torch.FloatTensor([[0,0,0,0]]).to(samples.tensors.device) for gt in targets]
+            
+        else:
+            gt_boxes = None
+        outputs = model(samples,gt_boxes=gt_boxes)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 

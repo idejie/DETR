@@ -2,6 +2,7 @@
 """
 DETR model and criterion classes.
 """
+from operator import gt
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -20,7 +21,7 @@ from .transformer import build_transformer
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False,teacher = False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -40,8 +41,12 @@ class DETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
+        if teacher:
+            self.query_embed_sp = MLP(4, hidden_dim, hidden_dim, 2)
+            self.query_embed_obj = MLP(1, hidden_dim, hidden_dim, 2)
 
-    def forward(self, samples: NestedTensor):
+
+    def forward(self, samples: NestedTensor,gt_boxes=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -62,13 +67,46 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        gt_q_mask = None
+        if gt_boxes is not None:
+            max_len = 0
+            bs = len(gt_boxes)
+            for item in gt_boxes:
+                max_len = max(max_len, len(item))
+            gt_obj_vec = torch.zeros([max_len, bs, 1]).type_as(gt_boxes[0])
+            gt_sp_vec = torch.zeros([max_len, bs, 4]).type_as(gt_boxes[0])
+            gt_q_mask = torch.ones([bs, max_len]).type_as(gt_boxes[0]).type(torch.bool)
+            #############################################################################
+            for i in range(len(gt_boxes)):
+                item = gt_boxes[i]
+                if len(item) == 0:
+                    gt_q_mask[i, :] = False
+                    continue
+                gt_sp_vec[0:len(item), i, :] = item
+                gt_q_mask[i, 0:len(item)] = False
+            # todo
+            t_sp = torch.tanh(self.query_embed_sp(gt_sp_vec))
+            t_obj_emb = self.query_embed_obj(gt_obj_vec)
+        else:
+            t_sp,t_obj_emb=None,None
+        hs,attn, hs_t,attn_t = self.transformer(self.input_proj(src), mask, self.query_embed.weight, 
+                                                    query_embed_q=t_sp, query_embed_e=t_obj_emb,   query_embed2_mask=gt_q_mask,
+                                                    pos_embed=pos[-1])
 
         outputs_class = self.class_embed(hs)
+        
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-        if self.aux_loss:
+        
+        out = {'hs': hs[-1],'att': attn[-1], 'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        if gt_boxes is not None:
+            outputs_class_T = self.class_embed(hs_t)
+            outputs_coord_T = self.bbox_embed(hs_t).sigmoid()
+            out.update({ 'hs_gt': hs_t[-1], 'att_gt': attn_t[-1], 'pred_logits_gt': outputs_class_T[-1], 'pred_boxes_gt': outputs_coord_T[-1]})
+        if self.aux_loss and gt_boxes is None:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        if gt_boxes is not None:
+            aux_output = self._set_aux_loss_T(hs,attn,outputs_class, outputs_coord, hs_t,attn_t,outputs_class_T, outputs_coord_T)
+            out['aux_outputs'] = aux_output
         return out
 
     @torch.jit.unused
@@ -78,6 +116,13 @@ class DETR(nn.Module):
         # as a dict having both a Tensor and a list.
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+    @torch.jit.unused
+    def _set_aux_loss_T(self, hs,attn,outputs_class, outputs_coord, hs_t,attn_t,outputs_class_t, outputs_coord_t):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        return [{'hs': h,'att': a,'hs_gt': h,'att_gt': a,'pred_logits': oc, f'pred_boxes': od,'pred_logits_gt': oc_t, f'pred_boxes_gt': od_t}
+                for h,a,oc,od, h_t,a_t,oc_t,od_t in zip(hs[:-1],attn[:-1],outputs_class[:-1], outputs_coord[:-1], hs_t[:-1],attn_t[:-1],outputs_class_t[:-1], outputs_coord_t[:-1])]
 
 
 class SetCriterion(nn.Module):
@@ -86,7 +131,7 @@ class SetCriterion(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,teacher=False):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -104,8 +149,9 @@ class SetCriterion(nn.Module):
         empty_weight = torch.ones(self.num_classes + 1)
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
+        self.teacher = teacher
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_labels(self, outputs, targets, indices, gt_idx,num_boxes, log=True):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -125,9 +171,28 @@ class SetCriterion(nn.Module):
             # TODO this should probably be a separate loss, not hacked in this one here
             losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
         return losses
+    def loss_labels_gt(self, outputs, targets, indices, gt_idx,num_boxes, log=True):
+        """Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits_gt' in outputs
+        src_logits = outputs['pred_logits_gt']
+     
+        target_classes_o = torch.cat([t["labels"] for t in targets])
+        src_logits = src_logits[gt_idx]
+        if len(target_classes_o) == 0:
+            loss_ce = src_logits.sum()
+        else:
+            loss_ce = F.cross_entropy(src_logits, target_classes_o, self.empty_weight)
+        losses = {'loss_ce_gt': loss_ce}
+
+        if log:
+            # TODO this should probably be a separate loss, not hacked in this one here
+            losses['class_error_gt'] = 100 - accuracy(src_logits, target_classes_o)[0]
+        return losses
 
     @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+    def loss_cardinality(self, outputs, targets, indices,gt_idx, num_boxes):
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
@@ -139,8 +204,21 @@ class SetCriterion(nn.Module):
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
+    @torch.no_grad()
+    def loss_cardinality_gt(self, outputs, targets, indices,gt_idx, num_boxes):
+        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
+        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
+        """
+        pred_logits = outputs['pred_logits_gt']
+        device = pred_logits.device
+        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
+        # Count the number of predictions that are NOT "no-object" (which is the last class)
+        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
+        losses = {'cardinality_error_gt': card_err}
+        return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    def loss_boxes(self, outputs, targets, indices, gt_idx,num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
@@ -160,8 +238,28 @@ class SetCriterion(nn.Module):
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
+    def loss_boxes_gt(self, outputs, targets, indices,gt_idx, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes_gt' in outputs
+        idx = gt_idx
+        src_boxes = outputs['pred_boxes_gt'][idx]
+        target_boxes = torch.cat([t['boxes'] for t in targets ], dim=0)
 
-    def loss_masks(self, outputs, targets, indices, num_boxes):
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox_gt'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou_gt'] = loss_giou.sum() / num_boxes
+        return losses
+
+    def loss_masks(self, outputs, targets, indices,gt_idx, num_boxes):
         """Compute the losses related to the masks: the focal loss and the dice loss.
            targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
@@ -188,6 +286,57 @@ class SetCriterion(nn.Module):
             "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
             "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
         }
+        
+        return losses
+    def loss_match_cosine(self, outputs, targets, indices, gt_idx,num_boxes):
+        
+        hs = outputs['hs']
+        hs_gt = outputs['hs_gt']
+
+        idx = self._get_src_permutation_idx(indices)
+        target_hs = hs[idx]
+        target_hs_gt = torch.cat([t[i] for t, (_, i) in zip(hs_gt, indices)], dim=0)
+
+        if len(target_hs) > 0:
+            # todo
+            # pred_verb_logits = outputs['pred_verb_logits'].sigmoid()
+            # pred_verb_logits_t = outputs['gt_verb_logits'].sigmoid()
+            # pred_verb_logits = pred_verb_logits[idx]
+            # pred_verb_logits_t = torch.cat([t[i] for t, (_, i) in zip(pred_verb_logits_t, indices)], dim=0)
+            # weight = torch.mean(abs(pred_verb_logits_t - pred_verb_logits), dim=-1)
+            # loss_match = nn.CosineEmbeddingLoss(reduction='none')(target_hs, target_hs_gt,
+            #                                                       torch.ones([target_hs.size()[0]]).to(
+            #                                                           target_hs_gt.device)) * (1+weight)
+            #
+            # loss_match = torch.mean(loss_match)
+
+            loss_match = nn.CosineEmbeddingLoss()(target_hs, target_hs_gt,
+                                                  torch.ones([target_hs.size()[0]]).to(target_hs_gt.device))
+        else:
+            loss_match = torch.zeros([]).type_as(target_hs)
+        losses = {'loss_match': loss_match}
+        return losses
+
+    def loss_match_kl(self, outputs, targets, indices,gt_idx, num_boxes):
+        # print('loss_match_kl',outputs.keys(),'att' in outputs)
+        hs = outputs['att']
+        hs_gt = outputs['att_gt']
+        # idx = self._get_src_permutation_idx(indices)
+        # target_hs = hs[idx[0], :, idx[0], :]
+        # target_hs_gt = torch.cat([t[:, i, :] for t, (_, i) in zip(hs_gt, indices)], dim=1)
+        #
+        # target_hs = target_hs.transpose(0, 1).reshape(-1, hs.size()[-1])
+        # target_hs_gt = target_hs_gt.reshape(-1, hs.size()[-1])
+
+        idx = self._get_src_permutation_idx(indices)
+        target_hs = hs[idx]
+        target_hs_gt = torch.cat([t[i] for t, (_, i) in zip(hs_gt, indices)], dim=0)
+
+        if len(target_hs) > 0:
+            loss_match = 10 * nn.KLDivLoss()((target_hs + 1e-6).log(), target_hs_gt) / 3
+        else:
+            loss_match = torch.zeros([]).type_as(target_hs)
+        losses = {'loss_match_att': loss_match}
         return losses
 
     def _get_src_permutation_idx(self, indices):
@@ -202,15 +351,21 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+    def get_loss(self, loss, outputs, targets, indices,gt_idx, num_boxes, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'labels_gt': self.loss_labels_gt,
+            'cardinality_gt': self.loss_cardinality_gt,
+            'boxes_gt': self.loss_boxes_gt,
+            'masks': self.loss_masks,
+            'match': self.loss_match_cosine,
+            'match_att': self.loss_match_kl,
+
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+        return loss_map[loss](outputs, targets, indices,gt_idx, num_boxes, **kwargs)
 
     def forward(self, outputs, targets):
         """ This performs the loss computation.
@@ -219,7 +374,7 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        outputs_without_aux = {k: v for k, v in outputs.items() if 'aux_outputs' not in k}
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
@@ -230,11 +385,22 @@ class SetCriterion(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
-
+        if 'pred_logits_gt' in outputs:
+            batch_idx = []
+            batch_idx1 = []
+            for i, t in enumerate(targets):
+                batch_idx.extend([i] * len(t['boxes']))
+                batch_idx1.extend(torch.arange(0, len(t['boxes'])))
+            gt_idx = []
+            gt_idx.append(batch_idx)
+            gt_idx.append(batch_idx1)
+        else:
+            gt_idx = None
         # Compute all the requested losses
         losses = {}
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+            if ('match' in loss or 'gt' in loss)and ('hs_gt' not in outputs): continue
+            losses.update(self.get_loss(loss, outputs, targets, indices,gt_idx, num_boxes))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -248,17 +414,29 @@ class SetCriterion(nn.Module):
                     if loss == 'labels':
                         # Logging is enabled only for the last layer
                         kwargs = {'log': False}
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    if loss == "labels_gt"and 'pred_logits_gt' not in aux_outputs: continue
+                    if loss == "boxes_gt" and 'pred_boxes_gt' not in aux_outputs: continue
+                    if loss == "cardinality_gt" and 'pred_logits_gt' not in aux_outputs: continue
+                    a = (loss == "match" or 'hs'  not in aux_outputs) 
+                    b = ((loss == "match_att" and i < 3) or 'att' not in aux_outputs)
+                    if a or b:
+                        continue
+                    try:
+                        l_dict = self.get_loss(loss, aux_outputs, targets, indices,gt_idx, num_boxes, **kwargs)
+                    except:
+                        
+                        print('======='*5,loss,self.teacher,aux_outputs.keys(),a,b,'======='*5)
+                        raise
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-
+        # print('losses',losses.keys())
         return losses
 
 
 class PostProcess(nn.Module):
     """ This module converts the model's output into the format expected by the coco api"""
     @torch.no_grad()
-    def forward(self, outputs, target_sizes,topk=15):
+    def forward(self, outputs, target_sizes):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
@@ -276,13 +454,13 @@ class PostProcess(nn.Module):
         scores, labels = prob[..., :-1].max(-1)
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        _,indices = torch.topk(scores,topk)
+        # _,indices = torch.topk(scores,topk)
         # and from relative [0, 1] to absolute [0, height] coordinates
         img_h, img_w = target_sizes.unbind(1)
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
-        results = [{'scores': s[i], 'labels': l[i], 'boxes': b[i]} for s, l, b,i in zip(scores, labels, boxes,indices)]
+        results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
 
         return results
 
@@ -329,12 +507,19 @@ def build(args):
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
+        teacher=args.teacher,
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': 1, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    if args.teacher:
+        weight_dict['loss_ce_gt'] = 1
+        weight_dict['loss_bbox_gt'] = args.bbox_loss_coef
+        weight_dict['loss_giou_gt'] = args.giou_loss_coef
+        weight_dict['loss_match'] = 1
+        weight_dict['loss_match_att'] = 1
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
@@ -346,10 +531,12 @@ def build(args):
         weight_dict.update(aux_weight_dict)
 
     losses = ['labels', 'boxes', 'cardinality']
+    if args.teacher:
+        losses += ['match', 'match_att','labels_gt','boxes_gt', 'cardinality_gt']
     if args.masks:
         losses += ["masks"]
     criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
-                             eos_coef=args.eos_coef, losses=losses)
+                             eos_coef=args.eos_coef, losses=losses,teacher=args.teacher)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess()}
     if args.masks:

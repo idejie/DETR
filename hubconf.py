@@ -2,7 +2,7 @@
 import torch
 
 from models.backbone import Backbone, Joiner
-from models.detr import DETR, PostProcess
+from models.detr_old import DETR, PostProcess
 from models.position_encoding import PositionEmbeddingSine
 from models.segmentation import DETRsegm, PostProcessPanoptic
 from models.transformer import Transformer

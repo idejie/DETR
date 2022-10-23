@@ -3,4 +3,5 @@ from .detr import build
 
 
 def build_model(args):
+    print('xxx')
     return build(args)

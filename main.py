@@ -38,7 +38,7 @@ def get_args_parser():
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
-    parser.add_argument('--teacher', default=True, type=bool,action='store_false')
+    parser.add_argument('--teacher', default=False,action='store_true')
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
                         help="Number of encoding layers in the transformer")
@@ -111,7 +111,8 @@ def main(args):
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
     print(args)
-
+    if args.teacher:
+        args.output_dir = args.output_dir+'_teacher'
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
@@ -204,15 +205,30 @@ def main(args):
             torch.save(model1, "detr-r50_test_%d.pth"%num_class)
             checkpoint = torch.load("detr-r50_test_%d.pth"%num_class, map_location='cpu')
         print('loaded checkpoint', args.resume)
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        # if args.teacher:
+        #     model.load_state_dict({k.replace('module.',''):v for k,v in checkpoint['model'].items()})
+        # else:
+        model_without_ddp.load_state_dict(checkpoint['model'],strict=False)
         print('loaded model')
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            except:
+                pass
             args.start_epoch = checkpoint['epoch'] + 1
+            evaluate('mini_val',model, criterion, postprocessors,
+                                              data_loader_mini_val, base_ds_mini_val, device, args.output_dir)
 
     if args.eval:
-        test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
+        if args.teacher:
+            val_stats_T, _ = evaluate('mini_val',model, criterion, postprocessors,
+                                              data_loader_mini_val, base_ds_mini_val, device, args.output_dir,teacher=True)
+            test_stats_T, _ = evaluate('val',model, criterion, postprocessors,
+                                                data_loader_val, base_ds, device, args.output_dir,teacher=True)
+        val_stats, _ = evaluate('mini_val',model, criterion, postprocessors,
+                                              data_loader_mini_val, base_ds_mini_val, device, args.output_dir)
+        test_stats, coco_evaluator = evaluate('val',model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
@@ -227,7 +243,7 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm,teacher=args.teacher)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -243,9 +259,12 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
        
-        mini_val_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_mini_val, base_ds_mini_val, device, args.output_dir
-        )
+        if args.teacher:
+            mini_val_stats_T, coco_evaluator_T = evaluate('mini_val_T',model, criterion, postprocessors,
+                                              data_loader_mini_val, base_ds_mini_val, device, args.output_dir,teacher=True)
+        mini_val_stats, coco_evaluator = evaluate('mini_val',model, criterion, postprocessors,
+                                              data_loader_mini_val, base_ds_mini_val, device, args.output_dir)
+
         
         if (epoch+1) %10 != 0:
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -253,7 +272,10 @@ def main(args):
                         'epoch': epoch,
                         'n_parameters': n_parameters}
         else:
-            test_stats, coco_evaluator = evaluate(
+            test_stats_T, coco_evaluator_T = evaluate('val_T',
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,teacher=True
+            )
+            test_stats, coco_evaluator = evaluate('val',
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
 
