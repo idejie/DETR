@@ -222,9 +222,9 @@ def main(args):
 
     if args.eval:
         if args.teacher:
-            val_stats_T, _ = evaluate('mini_val',model, criterion, postprocessors,
+            val_stats_T, _ = evaluate('mini_val_T',model, criterion, postprocessors,
                                               data_loader_mini_val, base_ds_mini_val, device, args.output_dir,teacher=True)
-            test_stats_T, _ = evaluate('val',model, criterion, postprocessors,
+            test_stats_T, _ = evaluate('val_T',model, criterion, postprocessors,
                                                 data_loader_val, base_ds, device, args.output_dir,teacher=True)
         val_stats, _ = evaluate('mini_val',model, criterion, postprocessors,
                                               data_loader_mini_val, base_ds_mini_val, device, args.output_dir)
